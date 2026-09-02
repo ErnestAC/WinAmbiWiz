@@ -2,26 +2,22 @@
 """
 AmbiWiz - Windows
 
-Captures the Windows desktop, calculates one average ambient color,
-enhances/smooths it, and sends the exact same RGB value to every
-configured WiZ light.
+Windows desktop capture -> average screen color -> enhanced color
+-> identical RGB value sent to every configured WiZ light.
 
-This version uses dxcam for Windows desktop capture.
+Uses DXcam / Windows Desktop Duplication.
+
+Both WiZ lights are treated as ONE illumination zone.
 """
 
 import colorsys
 import json
 import socket
 import sys
-import threading
 import time
 
-try:
-    import dxcam
-except ImportError:
-    print("ERROR: dxcam is not installed.")
-    print("Run: python -m pip install -r requirements.txt")
-    sys.exit(1)
+import dxcam
+
 
 # ============================================================
 # CONFIGURATION
@@ -31,8 +27,6 @@ except ImportError:
 # WIZ LIGHTS
 # ------------------------------------------------------------
 
-# These lights form ONE illumination zone.
-# Both lights always receive the exact same RGB value.
 WIZ_LIGHTS = [
     "10.0.0.153",
     "10.0.0.50",
@@ -40,18 +34,39 @@ WIZ_LIGHTS = [
 
 WIZ_PORT = 38899
 
+
 # ------------------------------------------------------------
-# UPDATE / RESPONSE
+# CAPTURE
 # ------------------------------------------------------------
 
-UPDATE_INTERVAL = 0.05       # 20 color calculations/sec
+# DXGI monitor/output index.
+# 0 = primary monitor
+CAPTURE_MONITOR = 0
+
+CAPTURE_FPS = 30
+
+# Number of pixels sampled horizontally/vertically.
+SAMPLE_COLUMNS = 32
+SAMPLE_ROWS = 18
+
+
+# ------------------------------------------------------------
+# UPDATE
+# ------------------------------------------------------------
+
+UPDATE_INTERVAL = 0.05
+
+# Higher = follows screen changes faster.
 SMOOTHING = 0.25
+
+# Only send to WiZ if RGB changed by this amount.
+COLOR_THRESHOLD = 2
+
 
 # ------------------------------------------------------------
 # COLOR PROCESSING
 # ------------------------------------------------------------
 
-COLOR_THRESHOLD = 2
 DARK_THRESHOLD = 10
 
 SATURATION_BOOST = 1.60
@@ -61,26 +76,29 @@ CONTRAST = 1.20
 
 BLACK_SCREEN_THRESHOLD = 8
 
+
 # ------------------------------------------------------------
-# SCREEN CAPTURE
+# DEBUG
 # ------------------------------------------------------------
 
-# DXGI output index. 0 is normally the primary monitor.
-# Use 1, 2, etc. for another monitor if needed.
-CAPTURE_MONITOR = 0
+# Print calculated colors.
+SHOW_COLOR = True
 
-SAMPLE_COLUMNS = 32
-SAMPLE_ROWS = 18
+# How often to print color information.
+DEBUG_INTERVAL = 1.0
+
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
 ambient_color = [0.0, 0.0, 0.0]
+
 last_sent_color = [-100, -100, -100]
 
-capture_lock = threading.Lock()
-latest_frame = None
+last_debug_time = 0.0
+
+last_frame_time = 0.0
 
 
 # ============================================================
@@ -92,7 +110,10 @@ def clamp(value, minimum=0.0, maximum=255.0):
 
 
 def clamp_rgb(values):
-    return tuple(int(round(clamp(value))) for value in values)
+    return tuple(
+        int(round(clamp(value)))
+        for value in values
+    )
 
 
 def color_changed(old, new):
@@ -107,6 +128,7 @@ def color_changed(old, new):
 # ============================================================
 
 def enhance_color(rgb):
+
     r, g, b = rgb
 
     r /= 255.0
@@ -115,9 +137,11 @@ def enhance_color(rgb):
 
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
 
+    # Saturation
     s *= SATURATION_BOOST
     s = max(0.0, min(1.0, s))
 
+    # Brightness
     v *= BRIGHTNESS_BOOST
 
     if v > 0.0:
@@ -127,6 +151,7 @@ def enhance_color(rgb):
 
     r, g, b = colorsys.hsv_to_rgb(h, s, v)
 
+    # Contrast
     r = ((r - 0.5) * CONTRAST) + 0.5
     g = ((g - 0.5) * CONTRAST) + 0.5
     b = ((b - 0.5) * CONTRAST) + 0.5
@@ -135,58 +160,58 @@ def enhance_color(rgb):
     g = max(0.0, min(1.0, g))
     b = max(0.0, min(1.0, b))
 
-    return r * 255.0, g * 255.0, b * 255.0
+    return (
+        r * 255.0,
+        g * 255.0,
+        b * 255.0,
+    )
 
 
 # ============================================================
-# WINDOWS CAPTURE
+# SCREEN COLOR
 # ============================================================
 
-def capture_frame(camera):
-    global latest_frame
+def calculate_screen_color(frame):
 
-    frame = camera.grab()
+    if frame is None:
+        return None
 
-    if frame is not None:
-        with capture_lock:
-            latest_frame = frame.copy()
-
-
-def calculate_screen_color():
-    with capture_lock:
-        if latest_frame is None:
-            return None
-        frame = latest_frame.copy()
-
-    height, width = frame.shape[:2]
+    try:
+        height, width = frame.shape[:2]
+    except Exception:
+        return None
 
     if width <= 0 or height <= 0:
         return None
 
-    # dxcam returns BGRA/BGR depending on configuration.
-    # The camera below is configured for BGR.
     step_x = max(1, width // SAMPLE_COLUMNS)
     step_y = max(1, height // SAMPLE_ROWS)
 
     total_r = 0.0
     total_g = 0.0
     total_b = 0.0
+
     count = 0
 
     for y in range(0, height, step_y):
+
         for x in range(0, width, step_x):
-            b, g, r = frame[y, x][:3]
 
-            r = int(r)
-            g = int(g)
-            b = int(b)
+            pixel = frame[y, x]
 
+            # DXcam BGRA
+            b = int(pixel[0])
+            g = int(pixel[1])
+            r = int(pixel[2])
+
+            # Ignore almost-black pixels.
             if r + g + b < DARK_THRESHOLD:
                 continue
 
             total_r += r
             total_g += g
             total_b += b
+
             count += 1
 
     if count == 0:
@@ -200,103 +225,236 @@ def calculate_screen_color():
 
 
 # ============================================================
-# WIZ CONTROL
+# WIZ
 # ============================================================
 
 def send_wiz_color(rgb):
-    """
-    Send the EXACT SAME RGB value to every configured light.
-    """
 
+    r = int(rgb[0])
+    g = int(rgb[1])
+    b = int(rgb[2])
+
+    # ONE command.
+    # Both lights receive the exact same values.
     command = {
         "method": "setPilot",
         "params": {
             "state": True,
-            "r": int(rgb[0]),
-            "g": int(rgb[1]),
-            "b": int(rgb[2]),
+            "r": r,
+            "g": g,
+            "b": b,
         },
     }
 
     data = json.dumps(command).encode("utf-8")
 
-    sockets = []
+    for ip in WIZ_LIGHTS:
 
-    try:
-        for ip in WIZ_LIGHTS:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sockets.append((ip, sock))
+        try:
 
-        for ip, sock in sockets:
-            try:
-                sock.sendto(data, (ip, WIZ_PORT))
-            except OSError as error:
-                print(f"WiZ error ({ip}): {error}", flush=True)
+            with socket.socket(
+                socket.AF_INET,
+                socket.SOCK_DGRAM
+            ) as sock:
 
-    finally:
-        for _, sock in sockets:
-            try:
-                sock.close()
-            except Exception:
-                pass
+                sock.settimeout(1.0)
+
+                sock.sendto(
+                    data,
+                    (ip, WIZ_PORT)
+                )
+
+        except OSError as error:
+
+            print(
+                f"WiZ error ({ip}): {error}",
+                flush=True
+            )
 
 
 # ============================================================
-# LIGHT UPDATE
+# SMOOTHING
 # ============================================================
 
 def smooth_color(current, target):
+
     for channel in range(3):
+
         current[channel] += (
             target[channel] - current[channel]
         ) * SMOOTHING
 
 
-def update_lights():
-    global last_sent_color
+# ============================================================
+# CREATE CAMERA
+# ============================================================
+
+def create_camera():
+
+    print(
+        "Creating Windows desktop capture...",
+        flush=True
+    )
+
+    camera = dxcam.create(
+        output_idx=CAPTURE_MONITOR,
+        output_color="BGRA",
+        processor_backend="numpy",
+        max_buffer_len=8,
+    )
+
+    print(
+        "Capture: Windows Desktop Duplication",
+        flush=True
+    )
+
+    print(
+        f"DXGI monitor/output index: "
+        f"{CAPTURE_MONITOR}",
+        flush=True
+    )
+
+    return camera
+
+
+# ============================================================
+# START CAMERA
+# ============================================================
+
+def start_camera():
+
+    camera = create_camera()
+
+    camera.start(
+        target_fps=CAPTURE_FPS,
+        video_mode=True,
+    )
+
+    # Give DXcam a moment to obtain the first frame.
+    time.sleep(0.25)
+
+    return camera
+
+
+# ============================================================
+# STOP CAMERA
+# ============================================================
+
+def stop_camera(camera):
+
+    if camera is None:
+        return
 
     try:
-        target_color = calculate_screen_color()
+        camera.stop()
+    except Exception:
+        pass
 
-        if target_color is None:
-            return
+    try:
+        camera.release()
+    except Exception:
+        pass
 
-        screen_brightness = sum(target_color) / 3.0
 
-        if screen_brightness <= BLACK_SCREEN_THRESHOLD:
-            target_color = 0.0, 0.0, 0.0
-        else:
-            target_color = enhance_color(target_color)
+# ============================================================
+# GET FRAME
+# ============================================================
 
-        smooth_color(ambient_color, target_color)
+def get_frame(camera):
 
-        rgb = clamp_rgb(ambient_color)
+    try:
 
-        if color_changed(last_sent_color, rgb):
-            send_wiz_color(rgb)
-            last_sent_color = list(rgb)
+        frame = camera.get_latest_frame()
+
+        if frame is not None:
+            return frame
 
     except Exception as error:
-        print(f"Color processing error: {error}", flush=True)
+
+        print(
+            f"Capture read error: {error}",
+            flush=True
+        )
+
+    return None
+
+
+# ============================================================
+# UPDATE LIGHTS
+# ============================================================
+
+def update_lights(frame):
+
+    global last_sent_color
+    global last_debug_time
+
+    target_color = calculate_screen_color(frame)
+
+    if target_color is None:
+        return
+
+    screen_brightness = (
+        sum(target_color) / 3.0
+    )
+
+    # Completely black screen.
+    if screen_brightness <= BLACK_SCREEN_THRESHOLD:
+
+        target_color = (
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    else:
+
+        target_color = enhance_color(
+            target_color
+        )
+
+    # Smooth toward target.
+    smooth_color(
+        ambient_color,
+        target_color
+    )
+
+    rgb = clamp_rgb(
+        ambient_color
+    )
+
+    # Debug output.
+    now = time.monotonic()
+
+    if (
+        SHOW_COLOR
+        and now - last_debug_time >= DEBUG_INTERVAL
+    ):
+
+        print(
+            f"SCREEN={tuple(round(x) for x in target_color)} "
+            f"OUTPUT={rgb}",
+            flush=True
+        )
+
+        last_debug_time = now
+
+    # Only send if color changed enough.
+    if color_changed(
+        last_sent_color,
+        rgb
+    ):
+
+        send_wiz_color(rgb)
+
+        last_sent_color = list(rgb)
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def create_camera():
-    print("Initializing Windows desktop capture...", flush=True)
-
-    monitor = int(CAPTURE_MONITOR)
-    camera = dxcam.create(output_idx=monitor, output_color="BGR")
-
-    print("Capture: Windows Desktop Duplication", flush=True)
-    print(f"DXGI monitor/output index: {monitor}", flush=True)
-
-    return camera
-
-
 def main():
+
     print()
     print("==========================================")
     print(" AmbiWiz - Windows")
@@ -304,67 +462,139 @@ def main():
     print()
 
     print("Illumination zone:")
+
     for ip in WIZ_LIGHTS:
         print(f"  -> {ip}")
 
     print()
-    print("Both lights will always receive the same RGB value.")
+
+    print(
+        "Both lights will always receive "
+        "the exact same RGB value."
+    )
+
     print()
 
     print("Color enhancement:")
-    print(f"  Saturation boost  : {SATURATION_BOOST:.2f}x")
-    print(f"  Brightness boost  : {BRIGHTNESS_BOOST:.2f}x")
-    print(f"  Minimum brightness: {MIN_BRIGHTNESS:.2f}")
-    print(f"  Contrast          : {CONTRAST:.2f}x")
+    print(
+        f"  Saturation boost  : "
+        f"{SATURATION_BOOST:.2f}x"
+    )
+    print(
+        f"  Brightness boost  : "
+        f"{BRIGHTNESS_BOOST:.2f}x"
+    )
+    print(
+        f"  Minimum brightness: "
+        f"{MIN_BRIGHTNESS:.2f}"
+    )
+    print(
+        f"  Contrast          : "
+        f"{CONTRAST:.2f}x"
+    )
+
     print()
+
+    camera = None
 
     try:
-        camera = create_camera()
-    except Exception as error:
-        print()
-        print("ERROR starting Windows screen capture:")
-        print(error)
-        print()
-        print("Make sure you are running this on Windows with")
-        print("a supported DXGI desktop capture environment.")
-        sys.exit(1)
 
-    try:
-        camera.start(
-            target_fps=30,
-            video_mode=False,
-        )
-    except Exception as error:
-        print()
-        print("ERROR starting capture:")
-        print(error)
-        sys.exit(1)
-
-    print()
-    print("AmbiWiz is running.")
-    print("Mode: Single illumination zone")
-    print(f"Lights: {len(WIZ_LIGHTS)}")
-    print()
-    print("Press Ctrl+C to stop.")
-    print()
-
-    try:
         while True:
-            update_lights()
-            time.sleep(UPDATE_INTERVAL)
+
+            # ------------------------------------------------
+            # Create/recreate camera
+            # ------------------------------------------------
+
+            if camera is None:
+
+                try:
+
+                    camera = start_camera()
+
+                    print()
+                    print(
+                        "AmbiWiz capture is active."
+                    )
+                    print()
+
+                except Exception as error:
+
+                    print()
+                    print(
+                        "ERROR starting Windows "
+                        "screen capture:"
+                    )
+                    print(error)
+                    print(
+                        "Retrying in 2 seconds..."
+                    )
+
+                    time.sleep(2)
+
+                    continue
+
+            # ------------------------------------------------
+            # Get latest frame
+            # ------------------------------------------------
+
+            frame = get_frame(camera)
+
+            if frame is None:
+
+                # The DXGI device may have been lost,
+                # the monitor may have changed, or Windows
+                # may temporarily have interrupted capture.
+
+                print(
+                    "No frame available. "
+                    "Reinitializing capture...",
+                    flush=True
+                )
+
+                stop_camera(camera)
+
+                camera = None
+
+                time.sleep(1)
+
+                continue
+
+            # ------------------------------------------------
+            # Process
+            # ------------------------------------------------
+
+            try:
+
+                update_lights(frame)
+
+            except Exception as error:
+
+                print(
+                    f"Color processing error: {error}",
+                    flush=True
+                )
+
+            time.sleep(
+                UPDATE_INTERVAL
+            )
 
     except KeyboardInterrupt:
+
         print()
         print("Stopping AmbiWiz...")
 
     finally:
-        try:
-            camera.stop()
-        except Exception:
-            pass
 
-        print("AmbiWiz stopped.")
+        stop_camera(camera)
 
+        print(
+            "AmbiWiz stopped."
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
